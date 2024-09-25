@@ -9,11 +9,13 @@ import threading
 from queue import Queue
 from threading import Event
 from ttkbootstrap import Style
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # 定义类别列表
 typeList = [
     {"id": 0, "name": "请选择分类", "key": ""},
-    {"id": 1, "name": "普通的", "key": "100"},
+    {"id": 1, "name": "普通的", "key": "000"},
     {"id": 2, "name": "二次元", "key": "010"},
     {"id": 3, "name": "三次元", "key": "001"},
     {"id": 4, "name": "普通的+二次元", "key": "110"},
@@ -49,7 +51,8 @@ headers = {}
 stop_event = Event()  # 用于控制线程停止的事件对象
 gui_queue = Queue()  # 用于GUI更新的队列
 image_queue = Queue()  # 用于存储图片路径的队列
-threads = []  # 存储所有正在运行的爬取线程
+# 全局锁对象
+download_lock = threading.Lock()
 
 
 def print_to_text(text_widget, message):
@@ -109,7 +112,7 @@ def get_user_input():
     if not first_page_entry.get() or not last_page_entry.get():
         messagebox.showerror("错误", "请输入起始页数和结束页数")
         return
-    if r18_key in ("010", "001", "011"):
+    if r18_key in ("101", "001", "011", "111"):
         cookies = cookie_entry.get()
         if not cookies or cookies == "请输入cookies":
             messagebox.showerror("错误", "请输入cookies")
@@ -140,7 +143,7 @@ def show_image_preview(image_path):
 
 
 def crawl_images(page):
-    global stop_event
+    global stop_event, download_lock
 
     gui_queue.put(f"正在爬取第{page}页的图片...")
 
@@ -175,6 +178,7 @@ def crawl_images(page):
             new_soup = BeautifulSoup(true_html.text, "lxml")
             new_link = new_soup.select_one("main section div img")
             if new_link and "src" in new_link.attrs:
+                gui_queue.put(f"当前下载文件Url{new_link}")
                 image_url = new_link["src"]
                 image_filename = f"{download_folder}/{image_url.split('/')[-1]}"
 
@@ -185,17 +189,19 @@ def crawl_images(page):
 
                 gui_queue.put(f"下载了图片 {image_url}")
 
-                if not os.path.exists(download_folder):
-                    os.makedirs(download_folder)
+                # 使用锁确保单线程下载
+                with download_lock:
+                    if not os.path.exists(download_folder):
+                        os.makedirs(download_folder)
 
-                with open(image_filename, "wb") as f:
-                    f.write(
-                        requests.get(
-                            image_url, headers=headers, proxies=proxies, timeout=10
-                        ).content
-                    )
-                # 将图片路径放入队列
-                image_queue.put(image_filename)
+                    with open(image_filename, "wb") as f:
+                        f.write(
+                            requests.get(
+                                image_url, headers=headers, proxies=proxies, timeout=10
+                            ).content
+                        )
+                    # 将图片路径放入队列
+                    image_queue.put(image_filename)
     except requests.RequestException as e:
         gui_queue.put(f"请求出错：{e}")
     except Exception as e:
@@ -203,56 +209,51 @@ def crawl_images(page):
 
 
 def start_crawl():
-    global stop_event, threads, download_folder
+    global stop_event, download_folder
     stop_event.clear()  # 清除停止事件
-    threads = []  # 清空线程列表
     crawl_button.config(state=tk.DISABLED)  # 禁用开始爬取按钮
     gui_queue.put(f"开始执行.......")
 
     # 动态创建文件夹
     download_folder = f"壁纸_{type_name}_{r18_name}_{sort_name}_{ai_name}"
 
-    for page in range(first_page, last_page + 1):
-        if stop_event.is_set():
-            break
-        thread = threading.Thread(target=crawl_images, args=(page,))
-        threads.append(thread)
-        thread.start()
-
-    def update_preview():
-        if not image_queue.empty():
-            image_path = image_queue.get()
-            show_image_preview(image_path)
-            root.after(100, update_preview)  # 继续检查队列
-        elif all(not t.is_alive() for t in threads):  # 确保所有线程已结束
-            gui_queue.put(f"执行结束.......")
-            crawl_button.config(state=tk.NORMAL)  # 重新启用开始爬取按钮
-        else:
-            root.after(100, update_preview)  # 继续检查队列
-
+    with ThreadPoolExecutor(max_workers=5) as executor:  # 限制最大并发数为5
+        futures = [
+            executor.submit(crawl_images, page)
+            for page in range(first_page, last_page + 1)
+        ]
+    # update_gui()
     update_preview()
 
 
+def update_preview():
+    if not image_queue.empty():
+        image_path = image_queue.get()
+        show_image_preview(image_path)
+        root.after(100, update_preview)  # 继续检查队列
+    else:
+        gui_queue.put(f"执行结束.......")
+        crawl_button.config(state=tk.NORMAL)  # 重新启用开始爬取按钮
+
+
+def update_gui():
+    while not gui_queue.empty():
+        message = gui_queue.get()
+        print_to_text(output_text, message)
+    root.after(100, update_gui)
+
+
 def stop_all_crawls():
-    global stop_event, threads
+    global stop_event
     stop_event.set()  # 设置停止事件
     gui_queue.put("停止所有爬取请求已发送...")
-
-    def check_threads():
-        if any(t.is_alive() for t in threads):
-            gui_queue.put("正在等待所有线程结束...")
-            root.after(100, check_threads)
-        else:
-            gui_queue.put("所有线程已结束，爬取已停止...")
-            reset_state()
-
-    check_threads()
+    gui_queue.put("爬取已停止...")
+    reset_state()
 
 
 def reset_state():
-    global stop_event, threads
+    global stop_event
     stop_event.clear()  # 清除停止事件
-    threads = []  # 清空线程列表
     output_text.config(state=tk.NORMAL)  # 重新启用输出框
     output_text.delete(1.0, tk.END)  # 清空输出框
     output_text.config(state=tk.DISABLED)  # 禁用输出框
@@ -272,6 +273,20 @@ root = style.master
 root.title("壁纸爬虫")
 # 设置窗口大小
 root.geometry("600x1000")
+# 加载图标并设置为窗口图标
+# 图标文件路径
+icon_path = "icon.png"
+
+# 检查图标文件是否存在
+if not os.path.exists(icon_path):
+    gui_queue.put(f"图标文件未找到，请确保路径正确并且图标文件存在。")
+else:
+    try:
+        icon_photo = tk.PhotoImage(file=icon_path)
+        root.wm_iconphoto(True, icon_photo)
+    except tk.TclError:
+        gui_queue.put(f"图标文件未找到，请确保路径正确并且图标文件存在。")
+
 
 # 设置窗口透明度
 root.attributes("-alpha", 0.9)  # 0.0 (完全透明) 到 1.0 (完全不透明)
