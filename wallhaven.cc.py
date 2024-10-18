@@ -375,7 +375,7 @@ cookie_label = ttk.Label(
 )
 cookie_label.grid(row=4, column=0, padx=10, pady=5, sticky="w")
 
-cookie_entry = ttk.Entry(root, style="Custom.TEntry", width=30)
+cookie_entry = ttk.Entry(root, style="Custom.TEntry", width=50)
 cookie_entry.insert(0, "请输入cookies")
 cookie_entry.bind(
     "<FocusIn>", lambda event: on_focus_in(event, cookie_entry, "请输入cookies")
