@@ -150,18 +150,41 @@ def show_image_preview(image_path):
 
 def download_image(image_url, image_filename):
     try:
-        response = requests.get(image_url, headers=headers, proxies=proxies, verify=False, stream=True, timeout=60)
+        response = requests.get(
+            image_url,
+            headers=headers,
+            proxies=proxies,
+            verify=False,
+            stream=True,
+            timeout=60,
+        )
         response.raise_for_status()
-        total_size = int(response.headers.get('content-length', 0))
+        total_size = int(response.headers.get("content-length", 0))
         block_size = 1024  # 1 Kibibyte
+        downloaded_size = 0
+        start_time = time.time()  # 记录开始时间
         with open(image_filename, "wb") as f:
             for data in response.iter_content(block_size):
+                if stop_event.is_set():
+                    gui_queue.put("爬取已停止...")
+                    break
                 if not data:
                     break
                 f.write(data)
-                downloaded_size = f.tell()
-                progress = (downloaded_size / total_size) * 100 if total_size != 0 else 0
-                gui_queue.put(f"下载图片进度: {image_filename} - {progress:.2f}%")
+                downloaded_size += len(data)
+                elapsed_time = time.time() - start_time  # 计算已用时间
+                if elapsed_time > 0:
+                    download_speed = (
+                        downloaded_size / elapsed_time / 1024
+                    )  # 计算下载速度（KB/s）
+                else:
+                    download_speed = 0
+                progress = (
+                    (downloaded_size / total_size) * 100 if total_size != 0 else 0
+                )
+                gui_queue.put(
+                    f"下载图片进度: {image_filename} - {progress:.2f}% - 速度: {download_speed:.2f} KB/s"
+                )
         gui_queue.put(f"成功下载图片: {image_filename}")
         return True
     except requests.RequestException as e:
@@ -169,8 +192,8 @@ def download_image(image_url, image_filename):
         return False
 
 
-def crawl_images(args):
-    page, stop_event, r18_key, type_key, sort_key, ai_key = args
+def crawl_images(page):
+    global stop_event, r18_key, type_key, sort_key, ai_key
 
     gui_queue.put(f"正在爬取第{page}页的图片...")
 
@@ -188,10 +211,8 @@ def crawl_images(args):
     headers["Connection"] = "close"
 
     url = f"https://wallhaven.cc/toplist?page={page}&categories={type_key}&sorting={sort_key}&ai_art_filter={ai_key}&purity={r18_key}"
-    
-    attempt = 0  # 初始化重试次数
+
     while not stop_event.is_set():
-  
         try:
             response = requests.get(
                 url, headers=headers, proxies=proxies, verify=False, timeout=60
@@ -199,53 +220,77 @@ def crawl_images(args):
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "lxml")
             links = soup.select("ul li figure a.preview")
-           
+
             for link in links:
                 if stop_event.is_set():
+                    gui_queue.put("爬取已停止...")
                     break
 
-                true_html = requests.get(
-                    link["href"], headers=headers, proxies=proxies, verify=False, timeout=60
-                )
-                new_soup = BeautifulSoup(true_html.text, "lxml")
-                new_link = new_soup.select_one("main section div img")
-                if new_link and "src" in new_link.attrs:
-                    image_url = new_link["src"]
-                    image_filename = f"{download_folder}/{image_url.split('/')[-1]}"
+                try:
+                    true_html = requests.get(
+                        link["href"],
+                        headers=headers,
+                        proxies=proxies,
+                        verify=False,
+                        timeout=60,
+                    )
+                    true_html.raise_for_status()
+                    new_soup = BeautifulSoup(true_html.text, "lxml")
+                    new_link = new_soup.select_one("main section div img")
+                    if new_link and "src" in new_link.attrs:
+                        image_url = new_link["src"]
+                        image_filename = f"{download_folder}/{image_url.split('/')[-1]}"
 
-                    if os.path.exists(image_filename) and os.path.getsize(image_filename) > 0:
-                        gui_queue.put(f"文件已存在，跳过下载：{image_filename}")
-                        continue
-                    elif os.path.exists(image_filename):
-                        os.remove(image_filename)
-                        gui_queue.put(f"删除大小为0的文件：{image_filename}")
-                        continue
-                    gui_queue.put(f"开始下载图片: {image_url}")
-                    if download_image(image_url, image_filename):
-                        image_queue.put(image_filename)
-                        root.after(0, update_preview)
+                        if (
+                            os.path.exists(image_filename)
+                            and os.path.getsize(image_filename) > 0
+                        ):
+                            gui_queue.put(f"文件已存在，跳过下载：{image_filename}")
+                            continue
+                        elif os.path.exists(image_filename):
+                            os.remove(image_filename)
+                            gui_queue.put(f"删除大小为0的文件：{image_filename}")
+                            continue
+                        gui_queue.put(f"开始下载图片: {image_url}")
+                        if download_image(image_url, image_filename):
+                            image_queue.put(image_filename)
+                            root.after(0, update_preview)
+                        time.sleep(5)
+                except requests.RequestException as e:
+                    gui_queue.put(f"下载图片时出错：{e}，失败图片Url：{link['href']}")
                     time.sleep(5)
-            attempt = 0  # 重置重试次数
+                    if stop_event.is_set():
+                        gui_queue.put("爬取已停止...")
+                        break
+                    continue
+                except Exception as e:
+                    gui_queue.put(f"未知错误：{e}，失败图片Url：{link['href']}")
+                    time.sleep(5)
+                    if stop_event.is_set():
+                        gui_queue.put("爬取已停止...")
+                        break
+                    continue
             break  # 如果成功则退出循环
         except requests.RequestException as e:
-            attempt += 1
-            gui_queue.put(f"请求出错：{e}，重试次数: {attempt}")
-            if stop_event.is_set():
-                break
+            gui_queue.put(f"请求出错：{e}")
+            time.sleep(5)
         except SSLError as e:
-            attempt += 1
-            gui_queue.put(f"SSL 错误：{e}，重试次数: {attempt}")
-            if stop_event.is_set():
-                break
+            gui_queue.put(f"SSL 错误：{e}")
+            time.sleep(5)
+
         except Exception as e:
-            attempt += 1
-            gui_queue.put(f"未知错误：{e}，重试次数: {attempt}")
-            if stop_event.is_set():
-                break
+            gui_queue.put(f"未知错误：{e}")
+            time.sleep(5)
+
+
+def thread_function():
+    global first_page, last_page
+    for page in range(first_page, last_page + 1):
+        crawl_images(page)
 
 
 def start_crawl():
-    global stop_event, download_folder, type_key, type_name, r18_key, r18_name, sort_key, sort_name, ai_key, ai_name, first_page, last_page, headers, proxies, output_text
+    global stop_event, download_folder, type_name, r18_name, sort_name, ai_name, proxies, output_text
     stop_event.clear()  # 清除停止事件
     crawl_button.config(state=tk.DISABLED)  # 禁用开始爬取按钮
     gui_queue.put(f"开始执行.......")
@@ -257,12 +302,9 @@ def start_crawl():
         os.makedirs(download_folder)
         gui_queue.put(f"创建文件夹: {download_folder}")
 
-    # 使用 ThreadPoolExecutor 替换 multiprocessing.Pool
+    # 使用 ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [
-            executor.submit(crawl_images, (page, stop_event, r18_key, type_key, sort_key, ai_key))
-            for page in range(first_page, last_page + 1)
-        ]
+        futures = [executor.submit(thread_function)]
         for future in futures:
             try:
                 future.result()  # 等待所有任务完成
@@ -280,8 +322,7 @@ def update_preview():
         show_image_preview(image_path)
         root.after(100, update_preview)  # 继续检查队列
     else:
-        gui_queue.put(f"执行结束.......")
-        crawl_button.config(state=tk.NORMAL)  # 重新启用开始爬取按钮
+        gui_queue.put(f"预览图片.......")
 
 
 def update_gui():
@@ -302,7 +343,6 @@ def stop_all_crawls():
 
 def reset_state():
     global stop_event
-    stop_event.clear()  # 清除停止事件
     output_text.config(state=tk.NORMAL)  # 重新启用输出框
     output_text.delete(1.0, tk.END)  # 清空输出框
     output_text.config(state=tk.DISABLED)  # 禁用输出框
@@ -318,9 +358,7 @@ def on_close():
 
 if __name__ == "__main__":
     # 初始化 ttkbootstrap 主题
-    style = Style(
-        theme="darkly"
-    )
+    style = Style(theme="superhero")
     root = style.master
     root.title("壁纸爬虫")
     root.geometry("800x1200")
@@ -345,13 +383,17 @@ if __name__ == "__main__":
     canvas.grid(row=0, column=0, rowspan=13, columnspan=2, sticky="nsew")
     bg_canvas = canvas.create_image(0, 0, anchor=tk.NW, image=None)
 
-    # 修改: 加载背景图片
+    # 加载背景图片
     bg_image_path = "background.png"
     if os.path.exists(bg_image_path):
         bg_image = Image.open(bg_image_path)
         bg_photo = ImageTk.PhotoImage(bg_image)
+        canvas.config(
+            width=bg_photo.width(), height=bg_photo.height()
+        )  # 设置Canvas大小
         canvas.itemconfig(bg_canvas, image=bg_photo)
         canvas.bg_photo = bg_photo  # 防止被垃圾回收
+        gui_queue.put(f"背景图片已成功加载: {bg_image_path}")
     else:
         gui_queue.put(f"背景图片文件未找到，请确保路径正确并且背景图片文件存在。")
 
@@ -388,7 +430,7 @@ if __name__ == "__main__":
         textvariable=type_var,
         values=[item["name"] for item in typeList],
         state="readonly",
-        font=("Helvetica", 12)
+        font=("Helvetica", 12),
     )
     type_menu.grid(row=0, column=1, padx=20, pady=10, sticky="ew")
 
@@ -402,7 +444,7 @@ if __name__ == "__main__":
         textvariable=r18_var,
         values=[item["name"] for item in r18List],
         state="readonly",
-        font=("Helvetica", 12)
+        font=("Helvetica", 12),
     )
     r18_menu.grid(row=1, column=1, padx=20, pady=10, sticky="ew")
 
@@ -416,7 +458,7 @@ if __name__ == "__main__":
         textvariable=sort_var,
         values=[item["name"] for item in sortList],
         state="readonly",
-        font=("Helvetica", 12)
+        font=("Helvetica", 12),
     )
     sort_menu.grid(row=2, column=1, padx=20, pady=10, sticky="ew")
 
@@ -430,7 +472,7 @@ if __name__ == "__main__":
         textvariable=ai_var,
         values=[item["name"] for item in aiList],
         state="readonly",
-        font=("Helvetica", 12)
+        font=("Helvetica", 12),
     )
     ai_menu.grid(row=3, column=1, padx=20, pady=10, sticky="ew")
 
@@ -440,7 +482,9 @@ if __name__ == "__main__":
     )
     cookie_label.grid(row=4, column=0, padx=20, pady=10, sticky="w")
 
-    cookie_entry = ttk.Entry(root, style="Custom.TEntry", width=50, font=("Helvetica", 12))
+    cookie_entry = ttk.Entry(
+        root, style="Custom.TEntry", width=50, font=("Helvetica", 12)
+    )
     cookie_entry.insert(0, "请输入cookies")
     cookie_entry.bind(
         "<FocusIn>", lambda event: on_focus_in(event, cookie_entry, "请输入cookies")
@@ -454,13 +498,17 @@ if __name__ == "__main__":
     first_page_label = ttk.Label(root, text="请输入起始页数：", font=("Helvetica", 14))
     first_page_label.grid(row=5, column=0, padx=20, pady=10, sticky="w")
 
-    first_page_entry = ttk.Entry(root, style="Custom.TEntry", width=30, font=("Helvetica", 12))
+    first_page_entry = ttk.Entry(
+        root, style="Custom.TEntry", width=30, font=("Helvetica", 12)
+    )
     first_page_entry.insert(0, "请输入起始页数")
     first_page_entry.bind(
-        "<FocusIn>", lambda event: on_focus_in(event, first_page_entry, "请输入起始页数")
+        "<FocusIn>",
+        lambda event: on_focus_in(event, first_page_entry, "请输入起始页数"),
     )
     first_page_entry.bind(
-        "<FocusOut>", lambda event: on_focus_out(event, first_page_entry, "请输入起始页数")
+        "<FocusOut>",
+        lambda event: on_focus_out(event, first_page_entry, "请输入起始页数"),
     )
     first_page_entry.grid(row=5, column=1, padx=20, pady=10, sticky="ew")
 
@@ -468,13 +516,16 @@ if __name__ == "__main__":
     last_page_label = ttk.Label(root, text="请输入结束页数：", font=("Helvetica", 14))
     last_page_label.grid(row=6, column=0, padx=20, pady=10, sticky="w")
 
-    last_page_entry = ttk.Entry(root, style="Custom.TEntry", width=30, font=("Helvetica", 12))
+    last_page_entry = ttk.Entry(
+        root, style="Custom.TEntry", width=30, font=("Helvetica", 12)
+    )
     last_page_entry.insert(0, "请输入结束页数")
     last_page_entry.bind(
         "<FocusIn>", lambda event: on_focus_in(event, last_page_entry, "请输入结束页数")
     )
     last_page_entry.bind(
-        "<FocusOut>", lambda event: on_focus_out(event, last_page_entry, "请输入结束页数")
+        "<FocusOut>",
+        lambda event: on_focus_out(event, last_page_entry, "请输入结束页数"),
     )
     last_page_entry.grid(row=6, column=1, padx=20, pady=10, sticky="ew")
 
@@ -484,7 +535,9 @@ if __name__ == "__main__":
     )
     proxy_label.grid(row=7, column=0, padx=20, pady=10, sticky="w")
 
-    proxy_entry = ttk.Entry(root, style="Custom.TEntry", width=30, font=("Helvetica", 12))
+    proxy_entry = ttk.Entry(
+        root, style="Custom.TEntry", width=30, font=("Helvetica", 12)
+    )
     proxy_entry.insert(0, "127.0.0.1:7890")  # 默认值
     proxy_entry.bind(
         "<FocusIn>", lambda event: on_focus_in(event, proxy_entry, "127.0.0.1:7890")
@@ -519,7 +572,9 @@ if __name__ == "__main__":
     preview_label = ttk.Label(root, text="图片预览：", font=("Helvetica", 14))
     preview_label.grid(row=11, column=0, padx=20, pady=10, sticky="w")
 
-    preview_frame = ttk.Frame(root, borderwidth=2, relief="groove", width=500, height=500)
+    preview_frame = ttk.Frame(
+        root, borderwidth=2, relief="groove", width=500, height=500
+    )
     preview_frame.grid(row=12, column=0, columnspan=2, padx=20, pady=10, sticky="nsew")
 
     preview_label = ttk.Label(preview_frame)
