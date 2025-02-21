@@ -11,6 +11,9 @@ from threading import Event
 from ttkbootstrap import Style
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from requests.packages.urllib3.exceptions import SSLError
+import sys  # 添加sys模块导入
+import time  # 添加time模块导入
 
 # 定义类别列表
 typeList = [
@@ -131,7 +134,8 @@ def get_user_input():
 
     first_page = int(first_page_entry.get())
     last_page = int(last_page_entry.get())
-    start_crawl()
+    # 启动一个新的线程来运行爬取任务
+    threading.Thread(target=start_crawl).start()
 
 
 def show_image_preview(image_path):
@@ -143,7 +147,7 @@ def show_image_preview(image_path):
 
 
 def crawl_images(page):
-    global stop_event, download_lock
+    global stop_event, download_lock, failed_images
 
     gui_queue.put(f"正在爬取第{page}页的图片...")
 
@@ -160,52 +164,79 @@ def crawl_images(page):
     headers["User-Agent"] = random.choice(user_agent_list)
 
     url = f"https://wallhaven.cc/toplist?page={page}&purity={r18_key}&categories={type_key}&sorting={sort_key}&ai_art_filter={ai_key}"
-    try:
-        response = requests.get(
-            url, headers=headers, proxies=proxies, verify=False, timeout=10
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "lxml")
-        links = soup.select("ul li figure a.preview")
+    
+    attempt = 0  # 初始化重试次数
+    while not stop_event.is_set():
+        try:
+            response = requests.get(
+                url, headers=headers, proxies=proxies, verify=False, timeout=60  # 修改: 增加超时时间并忽略SSL验证
+            )
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "lxml")
+            links = soup.select("ul li figure a.preview")
+           
+            for link in links:
+                if stop_event.is_set():
+                    break
 
-        for link in links:
+                true_html = requests.get(
+                    link["href"], headers=headers, proxies=proxies, verify=False, timeout=60  # 修改: 增加超时时间
+                )
+                new_soup = BeautifulSoup(true_html.text, "lxml")
+                new_link = new_soup.select_one("main section div img")
+                if new_link and "src" in new_link.attrs:
+                    gui_queue.put(f"当前下载文件Url{new_link}")
+                    image_url = new_link["src"]
+                    image_filename = f"{download_folder}/{image_url.split('/')[-1]}"
+
+                    # 检查文件是否已经存在且大小不为0
+                    if os.path.exists(image_filename) and os.path.getsize(image_filename) > 0:
+                        gui_queue.put(f"文件已存在，跳过下载：{image_filename}")
+                        continue
+                    else:
+                        # 删除大小为0的文件
+                        if os.path.exists(image_filename):
+                            os.remove(image_filename)
+                            gui_queue.put(f"删除大小为0的文件：{image_filename}")
+                            continue
+
+                    gui_queue.put(f"下载了图片 {image_url}")    
+
+                    # 使用锁确保单线程下载
+                    with download_lock:
+                        if not os.path.exists(download_folder):
+                            os.makedirs(download_folder)
+
+                        with open(image_filename, "wb") as f:
+                            f.write(
+                                requests.get(
+                                    image_url, headers=headers, proxies=proxies,verify=False,  timeout=60  # 修改: 增加超时时间
+                                ).content
+                            )
+                        # 将图片路径放入队列
+                        image_queue.put(image_filename)
+                        # 更新图片预览
+                        root.after(0, update_preview)
+                    
+                    # 增加5秒的等待时间
+                    time.sleep(5)
+            attempt = 0  # 重置重试次数 # 修改: 重置重试次数
+            break  # 如果成功则退出循环
+        except requests.RequestException as e:
+            attempt += 1
+            gui_queue.put(f"请求出错：{e}，重试次数: {attempt}")
             if stop_event.is_set():
                 break
-
-            true_html = requests.get(
-                link["href"], headers=headers, proxies=proxies, timeout=10
-            )
-            new_soup = BeautifulSoup(true_html.text, "lxml")
-            new_link = new_soup.select_one("main section div img")
-            if new_link and "src" in new_link.attrs:
-                gui_queue.put(f"当前下载文件Url{new_link}")
-                image_url = new_link["src"]
-                image_filename = f"{download_folder}/{image_url.split('/')[-1]}"
-
-                # 检查文件是否已经存在
-                if os.path.exists(image_filename):
-                    gui_queue.put(f"文件已存在，跳过下载：{image_filename}")
-                    continue
-
-                gui_queue.put(f"下载了图片 {image_url}")
-
-                # 使用锁确保单线程下载
-                with download_lock:
-                    if not os.path.exists(download_folder):
-                        os.makedirs(download_folder)
-
-                    with open(image_filename, "wb") as f:
-                        f.write(
-                            requests.get(
-                                image_url, headers=headers, proxies=proxies, timeout=10
-                            ).content
-                        )
-                    # 将图片路径放入队列
-                    image_queue.put(image_filename)
-    except requests.RequestException as e:
-        gui_queue.put(f"请求出错：{e}")
-    except Exception as e:
-        gui_queue.put(f"未知错误：{e}")
+        except SSLError as e:
+            attempt += 1
+            gui_queue.put(f"SSL 错误：{e}，重试次数: {attempt}")
+            if stop_event.is_set():
+                break
+        except Exception as e:
+            attempt += 1
+            gui_queue.put(f"未知错误：{e}，重试次数: {attempt}")
+            if stop_event.is_set():
+                break
 
 
 def start_crawl():
@@ -217,13 +248,21 @@ def start_crawl():
     # 动态创建文件夹
     download_folder = f"壁纸_{type_name}_{r18_name}_{sort_name}_{ai_name}"
 
-    with ThreadPoolExecutor(max_workers=5) as executor:  # 限制最大并发数为5
+    with ThreadPoolExecutor(max_workers=1) as executor:  # 限制最大并发数为5
         futures = [
             executor.submit(crawl_images, page)
             for page in range(first_page, last_page + 1)
         ]
-    # update_gui()
+        # 等待所有任务完成或停止事件被设置
+        for future in futures:
+            if stop_event.is_set():
+                break
+            future.result()
+
     update_preview()
+
+    gui_queue.put(f"执行结束.......")
+    crawl_button.config(state=tk.NORMAL)  # 重新启用开始爬取按钮
 
 
 def update_preview():
@@ -262,17 +301,19 @@ def reset_state():
 
 def on_close():
     stop_all_crawls()
-    root.destroy()
+    root.quit()  # 确保主事件循环终止
+    root.destroy()  # 销毁窗口
+    sys.exit()  # 添加: 确保控制台也正常退出
 
 
 # 初始化 ttkbootstrap 主题
 style = Style(
-    theme="superhero"
+    theme="darkly"  # 修改: 更改为 'cosmo' 主题
 )  # 选择你喜欢的主题，例如 'litera', 'superhero', 'darkly' 等
 root = style.master
 root.title("壁纸爬虫")
 # 设置窗口大小
-root.geometry("600x1000")
+root.geometry("800x1200")  # 修改: 增加窗口大小
 # 加载图标并设置为窗口图标
 # 图标文件路径
 icon_path = "icon.png"
@@ -287,27 +328,35 @@ else:
     except tk.TclError:
         gui_queue.put(f"图标文件未找到，请确保路径正确并且图标文件存在。")
 
-
-# 设置窗口透明度
-root.attributes("-alpha", 0.9)  # 0.0 (完全透明) 到 1.0 (完全不透明)
-
-# 创建样式
-style = ttk.Style(root)
-style.configure(
-    "Custom.TButton",
-    font=("Helvetica", 12, "bold"),
-    foreground="black",
-    background="#F44336",
-)
-style.map("Custom.TButton", background=[("active", "#E53935")])
-
-# 设置输入框样式
-style.configure("Custom.TEntry", fieldbackground="white", foreground="gray")
-
 # 设置背景画布
 canvas = tk.Canvas(root, highlightthickness=0)
 canvas.grid(row=0, column=0, rowspan=13, columnspan=2, sticky="nsew")
 bg_canvas = canvas.create_image(0, 0, anchor=tk.NW, image=None)
+
+# 修改: 加载背景图片
+bg_image_path = "background.png"
+if os.path.exists(bg_image_path):
+    bg_image = Image.open(bg_image_path)
+    bg_photo = ImageTk.PhotoImage(bg_image)
+    canvas.itemconfig(bg_canvas, image=bg_photo)
+    canvas.bg_photo = bg_photo  # 防止被垃圾回收
+else:
+    gui_queue.put(f"背景图片文件未找到，请确保路径正确并且背景图片文件存在。")
+
+# 设置窗口透明度
+root.attributes("-alpha", 0.95)  # 修改: 增加透明度
+# 设置样式
+style = ttk.Style(root)
+style.configure(
+    "Custom.TButton",
+    font=("Helvetica", 14, "bold"),  # 修改: 增加字体大小
+    foreground="white",  # 修改: 改变字体颜色
+    background="#007bff",  # 修改: 改变按钮背景颜色
+)
+style.map("Custom.TButton", background=[("active", "#0056b3")])  # 修改: 改变按钮激活颜色
+
+# 设置输入框样式
+style.configure("Custom.TEntry", fieldbackground="white", foreground="gray")
 
 # 设置默认透明背景
 default_bg_image = Image.new(
@@ -318,8 +367,8 @@ root.default_bg_photo = default_bg_photo
 canvas.itemconfig(bg_canvas, image=default_bg_photo)
 
 # 类型选择
-type_label = ttk.Label(root, text="请选择分类：", font=("Helvetica", 12))
-type_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+type_label = ttk.Label(root, text="请选择分类：", font=("Helvetica", 14))  # 修改: 增加字体大小
+type_label.grid(row=0, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
 type_var = tk.StringVar(value="请选择分类")
 type_menu = ttk.Combobox(
@@ -327,12 +376,13 @@ type_menu = ttk.Combobox(
     textvariable=type_var,
     values=[item["name"] for item in typeList],
     state="readonly",
+    font=("Helvetica", 12)  # 修改: 增加字体大小
 )
-type_menu.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
+type_menu.grid(row=0, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # R18选择
-r18_label = ttk.Label(root, text="请选择颜色等级：", font=("Helvetica", 12))
-r18_label.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+r18_label = ttk.Label(root, text="请选择颜色等级：", font=("Helvetica", 14))  # 修改: 增加字体大小
+r18_label.grid(row=1, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
 r18_var = tk.StringVar(value="请选择颜色等级")
 r18_menu = ttk.Combobox(
@@ -340,12 +390,13 @@ r18_menu = ttk.Combobox(
     textvariable=r18_var,
     values=[item["name"] for item in r18List],
     state="readonly",
+    font=("Helvetica", 12)  # 修改: 增加字体大小
 )
-r18_menu.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+r18_menu.grid(row=1, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # 排序方式
-sort_label = ttk.Label(root, text="请选择排序方式：", font=("Helvetica", 12))
-sort_label.grid(row=2, column=0, padx=10, pady=5, sticky="w")
+sort_label = ttk.Label(root, text="请选择排序方式：", font=("Helvetica", 14))  # 修改: 增加字体大小
+sort_label.grid(row=2, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
 sort_var = tk.StringVar(value="请选择排序方式")
 sort_menu = ttk.Combobox(
@@ -353,12 +404,13 @@ sort_menu = ttk.Combobox(
     textvariable=sort_var,
     values=[item["name"] for item in sortList],
     state="readonly",
+    font=("Helvetica", 12)  # 修改: 增加字体大小
 )
-sort_menu.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
+sort_menu.grid(row=2, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # AI选择
-ai_label = ttk.Label(root, text="请选择是否包含AI：", font=("Helvetica", 12))
-ai_label.grid(row=3, column=0, padx=10, pady=5, sticky="w")
+ai_label = ttk.Label(root, text="请选择是否包含AI：", font=("Helvetica", 14))  # 修改: 增加字体大小
+ai_label.grid(row=3, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
 ai_var = tk.StringVar(value="请选择是否包含AI")
 ai_menu = ttk.Combobox(
@@ -366,16 +418,17 @@ ai_menu = ttk.Combobox(
     textvariable=ai_var,
     values=[item["name"] for item in aiList],
     state="readonly",
+    font=("Helvetica", 12)  # 修改: 增加字体大小
 )
-ai_menu.grid(row=3, column=1, padx=10, pady=5, sticky="ew")
+ai_menu.grid(row=3, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # Cookies输入框
 cookie_label = ttk.Label(
-    root, text="请输入cookies（如有需要）：", font=("Helvetica", 12)
+    root, text="请输入cookies（如有需要）：", font=("Helvetica", 14)  # 修改: 增加字体大小
 )
-cookie_label.grid(row=4, column=0, padx=10, pady=5, sticky="w")
+cookie_label.grid(row=4, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
-cookie_entry = ttk.Entry(root, style="Custom.TEntry", width=50)
+cookie_entry = ttk.Entry(root, style="Custom.TEntry", width=50, font=("Helvetica", 12))  # 修改: 增加字体大小
 cookie_entry.insert(0, "请输入cookies")
 cookie_entry.bind(
     "<FocusIn>", lambda event: on_focus_in(event, cookie_entry, "请输入cookies")
@@ -383,13 +436,13 @@ cookie_entry.bind(
 cookie_entry.bind(
     "<FocusOut>", lambda event: on_focus_out(event, cookie_entry, "请输入cookies")
 )
-cookie_entry.grid(row=4, column=1, padx=10, pady=5, sticky="ew")
+cookie_entry.grid(row=4, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # 起始页数输入框
-first_page_label = ttk.Label(root, text="请输入起始页数：", font=("Helvetica", 12))
-first_page_label.grid(row=5, column=0, padx=10, pady=5, sticky="w")
+first_page_label = ttk.Label(root, text="请输入起始页数：", font=("Helvetica", 14))  # 修改: 增加字体大小
+first_page_label.grid(row=5, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
-first_page_entry = ttk.Entry(root, style="Custom.TEntry", width=30)
+first_page_entry = ttk.Entry(root, style="Custom.TEntry", width=30, font=("Helvetica", 12))  # 修改: 增加字体大小
 first_page_entry.insert(0, "请输入起始页数")
 first_page_entry.bind(
     "<FocusIn>", lambda event: on_focus_in(event, first_page_entry, "请输入起始页数")
@@ -397,13 +450,13 @@ first_page_entry.bind(
 first_page_entry.bind(
     "<FocusOut>", lambda event: on_focus_out(event, first_page_entry, "请输入起始页数")
 )
-first_page_entry.grid(row=5, column=1, padx=10, pady=5, sticky="ew")
+first_page_entry.grid(row=5, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # 结束页数输入框
-last_page_label = ttk.Label(root, text="请输入结束页数：", font=("Helvetica", 12))
-last_page_label.grid(row=6, column=0, padx=10, pady=5, sticky="w")
+last_page_label = ttk.Label(root, text="请输入结束页数：", font=("Helvetica", 14))  # 修改: 增加字体大小
+last_page_label.grid(row=6, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
-last_page_entry = ttk.Entry(root, style="Custom.TEntry", width=30)
+last_page_entry = ttk.Entry(root, style="Custom.TEntry", width=30, font=("Helvetica", 12))  # 修改: 增加字体大小
 last_page_entry.insert(0, "请输入结束页数")
 last_page_entry.bind(
     "<FocusIn>", lambda event: on_focus_in(event, last_page_entry, "请输入结束页数")
@@ -411,15 +464,15 @@ last_page_entry.bind(
 last_page_entry.bind(
     "<FocusOut>", lambda event: on_focus_out(event, last_page_entry, "请输入结束页数")
 )
-last_page_entry.grid(row=6, column=1, padx=10, pady=5, sticky="ew")
+last_page_entry.grid(row=6, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # 代理输入框
 proxy_label = ttk.Label(
-    root, text="请输入代理地址（如有需要）：", font=("Helvetica", 12)
+    root, text="请输入代理地址（如有需要）：", font=("Helvetica", 14)  # 修改: 增加字体大小
 )
-proxy_label.grid(row=7, column=0, padx=10, pady=5, sticky="w")
+proxy_label.grid(row=7, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
-proxy_entry = ttk.Entry(root, style="Custom.TEntry", width=30)
+proxy_entry = ttk.Entry(root, style="Custom.TEntry", width=30, font=("Helvetica", 12))  # 修改: 增加字体大小
 proxy_entry.insert(0, "127.0.0.1:7890")  # 默认值
 proxy_entry.bind(
     "<FocusIn>", lambda event: on_focus_in(event, proxy_entry, "127.0.0.1:7890")
@@ -427,39 +480,38 @@ proxy_entry.bind(
 proxy_entry.bind(
     "<FocusOut>", lambda event: on_focus_out(event, proxy_entry, "127.0.0.1:7890")
 )
-proxy_entry.grid(row=7, column=1, padx=10, pady=5, sticky="ew")
+proxy_entry.grid(row=7, column=1, padx=20, pady=10, sticky="ew")  # 修改: 增加内边距
 
 # 爬取按钮
 crawl_button = ttk.Button(
     root, text="开始爬取", command=get_user_input, style="Custom.TButton"
 )
-crawl_button.grid(row=8, column=0, padx=20, pady=20, sticky="ew")
+crawl_button.grid(row=8, column=0, padx=30, pady=20, sticky="ew")  # 修改: 增加内边距
 
 # 停止按钮
 stop_button = ttk.Button(
     root, text="停止所有爬取", command=stop_all_crawls, style="Custom.TButton"
 )
-stop_button.grid(row=8, column=1, padx=20, pady=20, sticky="ew")
+stop_button.grid(row=8, column=1, padx=30, pady=20, sticky="ew")  # 修改: 增加内边距
 
 # 输出区域
-output_label = ttk.Label(root, text="日志信息：", font=("Helvetica", 12))
-output_label.grid(row=9, column=0, padx=10, pady=5, sticky="w")
+output_label = ttk.Label(root, text="日志信息：", font=("Helvetica", 14))  # 修改: 增加字体大小
+output_label.grid(row=9, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
 output_text = scrolledtext.ScrolledText(
-    root, wrap=tk.WORD, width=50, height=10, font=("Helvetica", 10)
+    root, wrap=tk.WORD, width=60, height=15, font=("Helvetica", 12)  # 修改: 增加宽度和高度
 )
-output_text.grid(row=10, column=0, columnspan=2, padx=10, pady=5, sticky="nsew")
+output_text.grid(row=10, column=0, columnspan=2, padx=20, pady=10, sticky="nsew")  # 修改: 增加内边距
 
 # 图片预览区域
-preview_label = ttk.Label(root, text="图片预览：", font=("Helvetica", 12))
-preview_label.grid(row=11, column=0, padx=10, pady=5, sticky="w")
+preview_label = ttk.Label(root, text="图片预览：", font=("Helvetica", 14))  # 修改: 增加字体大小
+preview_label.grid(row=11, column=0, padx=20, pady=10, sticky="w")  # 修改: 增加内边距
 
-preview_frame = ttk.Frame(root, borderwidth=2, relief="groove", width=400, height=400)
-preview_frame.grid(row=12, column=0, columnspan=2, padx=10, pady=5, sticky="nsew")
+preview_frame = ttk.Frame(root, borderwidth=2, relief="groove", width=500, height=500)  # 修改: 增加宽度和高度
+preview_frame.grid(row=12, column=0, columnspan=2, padx=20, pady=10, sticky="nsew")  # 修改: 增加内边距
 
 preview_label = ttk.Label(preview_frame)
 preview_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)  # 居中显示
-
 
 # 设置列权重以使组件居中
 root.columnconfigure(0, weight=1)
