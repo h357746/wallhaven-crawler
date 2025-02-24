@@ -1,2 +1,2 @@
-pyinstaller --onefile -F --icon=./icon.ico wallhaven.cc.py --name wallhaven.exe
-pyinstaller wallhaven.exe.spec
+pyinstaller --windowed --onefile -F --icon=./icon.ico wallhaven_crawler.py --name wallhaven_crawler.exe
+pyinstaller wallhaven_crawler.exe.spec

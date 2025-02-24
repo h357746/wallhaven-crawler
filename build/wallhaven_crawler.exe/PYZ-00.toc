@@ -1,0 +1,2 @@
+('C:\\Users\\h3577\\Pictures\\wallhaven-crawler\\build\\wallhaven_crawler.exe\\PYZ-00.pyz',
+ [])
